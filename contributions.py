@@ -50,7 +50,19 @@ class OrganizationDetail(BaseModel):
 async def get_organization_detail(
     client: httpx.AsyncClient, organization: str
 ) -> OrganizationDetail:
-    """"""
+    """
+    Return a detailed description of a GitHub organization.
+
+    Args:
+        client (httpx.AsyncClient): An asynchronous httpx client instance that has the
+            correct headers for communicating with the GitHub API set already.
+        organization (str): The name of the GitHub organization.
+
+    Returns:
+        OrganizationDetail: Specific fields of the extensive JSON response as described
+            by the model definition.
+
+    """
     response = await client.get(f"/orgs/{organization}")
     response.raise_for_status()
     return OrganizationDetail.parse_raw(response.text)
@@ -70,6 +82,20 @@ class Repository(BaseModel):
 
 
 async def get_repositories(client: httpx.AsyncClient, url: str) -> List[Repository]:
+    """
+    Return a list of GitHub repository descriptions.
+
+    Args:
+        client (httpx.AsyncClient): An asynchronous httpx client instance that has the
+            correct headers for communicating with the GitHub API set already.
+        url (str): The starting from which to fetch the repository list. Typically given
+            by `OrganizationDetail.repos_url`.
+
+    Returns:
+        list: A collection of repository descriptions as described by the `Repository`
+            model.
+
+    """
     repos = []
     while True:
         response = await client.get(
@@ -121,10 +147,21 @@ class RepositoryArguments(NamedTuple):
     slug: str
 
 
-async def get_contributions_by_login(
+async def get_contributions_by_author(
     args: RepositoryArguments,
 ) -> Dict[str, List[WeeklyContribution]]:
-    """"""
+    """
+    Retrieve code contributions to a specific repository as weekly reports by author.
+
+    Args:
+        args (RepositoryArguments): A `namedtuple` that includes all necessary
+            arguments.
+
+    Returns:
+        dict: A map from authors (given by their GitHub usernames) to their code
+            contributions as a list of weekly commits, additions, and deletions.
+
+    """
     logger.info("Retrieving %r contributions.", args.slug)
     url = f"/repos/{args.slug}/stats/contributors"
     exponent = 0
@@ -161,7 +198,25 @@ async def summarize_contributions(
     allow: Iterable = (),
     deny: Iterable = (),
 ) -> Dict[str, int]:
-    """"""
+    """
+    Summarize all code contributions over all of an organization's repositories.
+
+    Args:
+        organization (str): The name of the GitHub organization.
+        username (str): The name of the GitHub username making the requests. This is
+            used for identification in the 'User-Agent' header.
+        token (str): A personal GitHub token for authenticating with the GitHub API.
+        allow: An iterable of repository names to consider exclusively from the
+            organization.
+        deny: An iterable of repository names to exclude from the list of repositories
+            of a GitHub organization.
+
+    Returns:
+        dict: A map from author GitHub usernames to the number of code changes (added
+            and deleted lines of code) they have contributed across all of an
+            organization's repositories.
+
+    """
     headers = {
         "Authorization": f"token {token}",
         "User-Agent": username,
@@ -187,7 +242,7 @@ async def summarize_contributions(
         result: DefaultDict[str, int] = defaultdict(int)
         args = [RepositoryArguments(client, f"{organization}/{n}") for n in names]
         async with aiometer.amap(
-            get_contributions_by_login, args, max_per_second=5
+            get_contributions_by_author, args, max_per_second=5
         ) as contributions:
             async for repo_contrib in contributions:
                 for author, contribs in repo_contrib.items():
