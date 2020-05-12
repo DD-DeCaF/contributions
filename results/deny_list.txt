@@ -10,3 +10,14 @@ blog
 gecko-carotene-application
 ice
 contributions
+metabolica-ui-home
+metabolica-ui-login
+metabolica-ui
+metabolica-ui-pathways
+decaf-metabolica
+metabolica-ui-yields
+metabolica-ui-about
+metabolica-ui-map
+metabolica-ui-upload
+decaf-frontend-module-example
+cookiecutter-python-library
