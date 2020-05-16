@@ -18,54 +18,44 @@
 
 
 import argparse
-import asyncio
+import json
 import logging
+import sys
 from collections import defaultdict
 from getpass import getpass
 from operator import itemgetter
-from typing import Dict, List, DefaultDict, NamedTuple, Iterable
+from pathlib import Path
+from time import sleep
+from typing import DefaultDict, Dict, Iterable, List, Set, Tuple, Optional
 
-import aiometer
-import httpx
 import humanize
-from pydantic import BaseModel, Field, HttpUrl, parse_obj_as
+from gql import Client, gql
+from graphql.language.ast import Document
+from gql.transport.requests import RequestsHTTPTransport
+from pydantic import BaseModel, Field, HttpUrl
 
 
+formatting = logging.Formatter(fmt="[%(asctime)s] [%(levelname)s] %(message)s")
+terminal = logging.StreamHandler()
+terminal.setLevel(logging.INFO)
+terminal.setFormatter(formatting)
+log_file = logging.FileHandler("contributions.log", "w")
+log_file.setLevel(logging.DEBUG)
+log_file.setFormatter(formatting)
 logger = logging.getLogger("contributions")
+logger.addHandler(terminal)
+logger.addHandler(log_file)
 
 
 ########################################################################################
-# Organization Detail
+# Utilities
 ########################################################################################
 
 
-class OrganizationDetail(BaseModel):
-    """"""
-
-    id: int
-    login: str
-    repos_url: HttpUrl
-
-
-async def get_organization_detail(
-    client: httpx.AsyncClient, organization: str
-) -> OrganizationDetail:
-    """
-    Return a detailed description of a GitHub organization.
-
-    Args:
-        client (httpx.AsyncClient): An asynchronous httpx client instance that has the
-            correct headers for communicating with the GitHub API set already.
-        organization (str): The name of the GitHub organization.
-
-    Returns:
-        OrganizationDetail: Specific fields of the extensive JSON response as described
-            by the model definition.
-
-    """
-    response = await client.get(f"/orgs/{organization}")
-    response.raise_for_status()
-    return OrganizationDetail.parse_raw(response.text)
+def execute(client: Client, query: Document, **kwargs) -> dict:
+    response = client.execute(query, **kwargs)
+    logger.debug("Response:\n%s", json.dumps(response, indent=2))
+    return response
 
 
 ########################################################################################
@@ -73,41 +63,102 @@ async def get_organization_detail(
 ########################################################################################
 
 
-class Repository(BaseModel):
-    """"""
+class PageInfo(BaseModel):
 
-    id: int
+    has_next: bool = Field(..., alias="hasNextPage")
+    end_cursor: str = Field(..., alias="endCursor")
+
+
+class Repository(BaseModel):
+
+    id: str
     name: str
     url: HttpUrl
 
 
-async def get_repositories(client: httpx.AsyncClient, url: str) -> List[Repository]:
+class Repositories(BaseModel):
+
+    nodes: List[Repository]
+    page_info: PageInfo = Field(..., alias="pageInfo")
+    total: int = Field(..., alias="totalCount")
+
+
+class Organization(BaseModel):
+
+    id: str
+    repositories: Repositories
+
+
+class OrgResponse(BaseModel):
+
+    organization: Organization
+
+
+def get_repositories(client: Client, organization: str) -> List[Repository]:
     """
-    Return a list of GitHub repository descriptions.
+    Return a list of all repository descriptions in an organization.
 
     Args:
-        client (httpx.AsyncClient): An asynchronous httpx client instance that has the
-            correct headers for communicating with the GitHub API set already.
-        url (str): The starting from which to fetch the repository list. Typically given
-            by `OrganizationDetail.repos_url`.
+        client (gql.Client): A GraphQL client configured with the appropriate HTTP
+            headers.
+        organization (str): The name of the GitHub organization.
 
     Returns:
-        list: A collection of repository descriptions as described by the `Repository`
-            model.
+        list: A collection of descriptions as defined by the `Repository` model.
 
     """
-    repos = []
-    while True:
-        response = await client.get(
-            url, params={"type": "all", "sort": "full_name", "direction": "asc"}
+    query = gql(
+        """
+    query getOrganizationRepositories($org: String!, $cursor: String) {
+      organization(login: $org) {
+        id
+        repositories(first: 50, after: $cursor) {
+          totalCount
+          nodes {
+            id
+            name
+            url
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+      rateLimit {
+        limit
+        cost
+        remaining
+        resetAt
+        nodeCount
+      }
+    }
+    """
+    )
+    data = OrgResponse.parse_obj(
+        execute(client, query, variable_values={"org": organization})
+    )
+    repos = data.organization.repositories
+    result = repos.nodes
+    while repos.page_info.has_next:
+        logger.debug(
+            "Retrieving next page of repositories from cursor %r.",
+            repos.page_info.end_cursor,
         )
-        response.raise_for_status()
-        repos.extend(parse_obj_as(List[Repository], response.json()))
-        if "next" not in response.links:
-            break
-        url = response.links["next"]["url"]
-        logger.debug("Retrieving next page of repositories.\n%r", url)
-    return repos
+        data = OrgResponse.parse_obj(
+            execute(
+                client,
+                query,
+                variable_values={
+                    "org": organization,
+                    "cursor": repos.page_info.end_cursor,
+                },
+            )
+        )
+        repos = data.organization.repositories
+        result.extend(repos.nodes)
+    assert len(result) == repos.total
+    return result
 
 
 ########################################################################################
@@ -115,75 +166,149 @@ async def get_repositories(client: httpx.AsyncClient, url: str) -> List[Reposito
 ########################################################################################
 
 
-class WeeklyContribution(BaseModel):
-    """"""
+class User(BaseModel):
 
-    week_start: int = Field(..., alias="w")
-    additions: int = Field(..., alias="a")
-    deletions: int = Field(..., alias="d")
-    commits: int = Field(..., alias="c")
+    login: str
 
 
 class Author(BaseModel):
-    """"""
 
-    id: int
-    login: str
-    html_url: HttpUrl
+    name: str
+    email: str
+    user: Optional[User]
 
 
-class Contribution(BaseModel):
-    """"""
+class Commit(BaseModel):
 
-    total: int
-    weeks: List[WeeklyContribution]
+    sha: str = Field(..., alias="oid")
+    additions: int
+    deletions: int
     author: Author
 
 
-class RepositoryArguments(NamedTuple):
-    """"""
+class History(BaseModel):
 
-    client: httpx.AsyncClient
-    slug: str
+    nodes: List[Commit]
+    page_info: PageInfo = Field(..., alias="pageInfo")
+    total: int = Field(..., alias="totalCount")
 
 
-async def get_contributions_by_author(
-    args: RepositoryArguments,
-) -> Dict[str, List[WeeklyContribution]]:
+class Target(BaseModel):
+
+    history: History
+
+
+class Branch(BaseModel):
+
+    name: str
+    target: Target
+
+
+class BranchRepo(BaseModel):
+
+    default_branch: Branch = Field(..., alias="defaultBranchRef")
+
+
+class RepoResponse(BaseModel):
+
+    repository: BranchRepo
+
+
+def get_commits(client: Client, organization: str, name: str) -> List[Commit]:
     """
-    Retrieve code contributions to a specific repository as weekly reports by author.
+    Return the entire commit history of the default branch on a repository.
 
     Args:
-        args (RepositoryArguments): A `namedtuple` that includes all necessary
-            arguments.
+        client (gql.Client): A GraphQL client configured with the appropriate HTTP
+            headers.
+        organization (str): The name of the GitHub organization.
+        name (str): The name of the GitHub repository.
 
     Returns:
-        dict: A map from authors (given by their GitHub usernames) to their code
-            contributions as a list of weekly commits, additions, and deletions.
+        list: A collection of commits representing the complete history of the default
+            branch.
 
     """
-    logger.info("Retrieving %r contributions.", args.slug)
-    url = f"/repos/{args.slug}/stats/contributors"
-    exponent = 0
-    while True:
-        response = await args.client.get(url, timeout=None)
-        # GitHub API returns 202 to mean that contribution statistics will be
-        # calculated in the background.
-        if response.status_code != 202:
-            break
-        time = 2 ** exponent
-        logger.debug(
-            "Backing off for %d s retrieving contributions to %r.", time, args.slug
-        )
-        await asyncio.sleep(time)
-        exponent += 1
-    response.raise_for_status()
-    contributions: List[Contribution] = parse_obj_as(
-        List[Contribution], response.json()
-    )
-    return {
-        c.author.login: [w for w in c.weeks if w.commits > 0] for c in contributions
+    query = gql(
+        """
+    query getCommitInfo($org: String!, $name: String!, $cursor: String) {
+      repository(name: $name, owner: $org) {
+        defaultBranchRef {
+          name
+          target {
+            ... on Commit {
+              history(first: 100, after: $cursor) {
+                nodes {
+                  additions
+                  deletions
+                  author {
+                    email
+                    name
+                    user {
+                      login
+                    }
+                  }
+                  oid
+                }
+                totalCount
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                }
+              }
+            }
+          }
+        }
+      }
+      rateLimit {
+        limit
+        cost
+        remaining
+        resetAt
+        nodeCount
+      }
     }
+    """
+    )
+    logger.info("Retrieving commits from %s's default branch.", name)
+    for number in range(1, 8):
+        data = execute( client, query, variable_values={"org": organization, "name": name})
+        if data.get("repository", {}).get("defaultBranchRef") is None:
+            duration = 2 ** number
+            logger.warning("Backing off for %d s.", duration)
+            sleep(duration)
+            continue
+        else:
+            data = RepoResponse.parse_obj(data)
+            break
+    if number == 8:
+        raise RuntimeError("Failed to get a proper response.")
+    history = data.repository.default_branch.target.history
+    commits = history.nodes
+    while history.page_info.has_next:
+        logger.debug(
+            "Retrieving next page of commits from cursor %r.",
+            history.page_info.end_cursor,
+        )
+        for number in range(1, 8):
+            data = execute(client, query,
+                           variable_values={"org": organization, "name": name,
+                                            "cursor": history.page_info.end_cursor,
+                                            })
+            if data.get("repository", {}).get("defaultBranchRef") is None:
+                duration = 2 ** number
+                logger.warning("Backing off for %d s.", duration)
+                sleep(duration)
+                continue
+            else:
+                data = RepoResponse.parse_obj(data)
+                break
+        if number == 8:
+            raise RuntimeError("Failed to get a proper response.")
+        history = data.repository.default_branch.target.history
+        commits.extend(history.nodes)
+    assert len(commits) == history.total
+    return commits
 
 
 ########################################################################################
@@ -191,13 +316,13 @@ async def get_contributions_by_author(
 ########################################################################################
 
 
-async def summarize_contributions(
+def summarize_contributions(
     organization: str,
     username: str,
     token: str,
     allow: Iterable = (),
     deny: Iterable = (),
-) -> Dict[str, int]:
+) -> Tuple[Dict[str, int], Dict[str, Dict[str, Set[str]]]]:
     """
     Summarize all code contributions over all of an organization's repositories.
 
@@ -212,25 +337,26 @@ async def summarize_contributions(
             of a GitHub organization.
 
     Returns:
-        dict: A map from author GitHub usernames to the number of code changes (added
+        dict: A map from GitHub author emails to the number of code changes (added
             and deleted lines of code) they have contributed across all of an
             organization's repositories.
 
     """
-    headers = {
-        "Authorization": f"token {token}",
-        "User-Agent": username,
-        "Accept": "application/vnd.github.v3+json",
-    }
-    # The GitHub API may punish a burst of too many requests. We therefore limit our
-    # requests to five per second.
-    async with httpx.AsyncClient(
-        base_url="https://api.github.com", headers=headers,
-    ) as client:
-        logger.info("Retrieving GitHub organization details.")
-        org_detail = await get_organization_detail(client, organization)
-        logger.info("Retrieving organization's repositories.")
-        repos = await get_repositories(client, org_detail.repos_url)
+    github_transport = RequestsHTTPTransport(
+        url="https://api.github.com/graphql",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": username,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+        },
+        verify=True,
+        use_json=True,
+    )
+    with Client(transport=github_transport) as client:
+        logger.info("Retrieving %s's repositories.", organization)
+        repos = get_repositories(client, organization)
         # Filter the identified repositories using the list of allowed and denied
         # entries.
         names = {r.name for r in repos}
@@ -238,16 +364,18 @@ async def summarize_contributions(
             names.intersection_update(allow)
         if deny:
             names.difference_update(deny)
-        logger.info("Retrieving repository contributions.")
+
         result: DefaultDict[str, int] = defaultdict(int)
-        args = [RepositoryArguments(client, f"{organization}/{n}") for n in names]
-        async with aiometer.amap(
-            get_contributions_by_author, args, max_per_second=5
-        ) as contributions:
-            async for repo_contrib in contributions:
-                for author, contribs in repo_contrib.items():
-                    result[author] += sum(w.additions + w.deletions for w in contribs)
-    return dict(result)
+        authors = {}
+        for commits in (get_commits(client, organization, n) for n in sorted(names)):
+            for commit in commits:
+                email = commit.author.email
+                result[email] += commit.additions + commit.deletions
+                auth = authors.setdefault(email, {})
+                auth.setdefault("names", set()).add(commit.author.name)
+                if (user := commit.author.user) is not None:
+                    auth.setdefault("login", set()).add(user.login)
+    return dict(result), authors
 
 
 def main():
@@ -283,8 +411,10 @@ def main():
         type=argparse.FileType("r"),
     )
     args = parser.parse_args()
-    logging.basicConfig(level=args.verbosity, format="[%(levelname)s] %(message)s")
-    token = getpass("Token: ")
+    logger.setLevel(args.verbosity)
+    token = sys.stdin.read().rstrip("\r\n")
+    if not token:
+        token = getpass("Token: ")
     if args.allow is not None:
         allow = {l.strip() for l in args.allow.readlines()}
     else:
@@ -293,11 +423,13 @@ def main():
         deny = {l.strip() for l in args.deny.readlines()}
     else:
         deny = ()
-    summary = asyncio.run(
-        summarize_contributions(args.organization, args.username, token, allow, deny)
+    summary, authors = summarize_contributions(
+        args.organization, args.username, token, allow, deny
     )
-    for author, changes in sorted(summary.items(), key=itemgetter(1), reverse=True):
-        print(author, humanize.intcomma(changes))
+    for user, changes in sorted(summary.items(), key=itemgetter(1), reverse=True):
+        print(user, humanize.intcomma(changes))
+    with Path("authors.json").open("w") as handle:
+        json.dump(authors, handle, default=list)
 
 
 if __name__ == "__main__":
